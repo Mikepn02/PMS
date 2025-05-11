@@ -1,115 +1,143 @@
-import serial
 import csv
-import time
+import os
 from datetime import datetime
+import serial
+import serial.tools.list_ports
+import time
+import platform
 
-CSV_FILE = 'plates_log.csv'
-RATE_PER_HOUR = 200
+LOG_FILE = "plates_log.csv"
+TX_FILE = "data/transactions.csv"
+RATE_PER_HOUR = 200  # RWF per hour
+ser = None
 
-ser = serial.Serial('COM6', 9600, timeout=2)
-time.sleep(2)
-
-print("Welcome to Parking management system👋\n")
-
-
-def read_serial_line():
-    while True:
-        if ser.in_waiting:
-            return ser.readline().decode().strip()
-
-
-def parse_data(line):
+def listen_to_arduino(arduino_port, baud=9600):
+    global  ser
     try:
-        parts = line.split(';')
-        plate = parts[0].split(':')[1]
-        balance = float(parts[1].split(':')[1])
-        return plate, balance
-    except Exception as e:
-        print(f"Error parsing data: {e}")
-        return None, None
+        ser = serial.Serial(arduino_port, baud, timeout=2)
+        time.sleep(2)
+        print(f"🔌 Listening on {arduino_port}...")
 
+        while True:
+            line = ser.readline().decode('utf-8').strip()
+            if line:
+                print("📨 Received:", line)
+                process_message(line)
 
-def lookup_plate(plate):
-    with open(CSV_FILE, 'r') as f:
-        reader = csv.DictReader(f)
-        unpaid_entries = [
-            row for row in reader
-            if row['Plate Number'] == plate and row['Payment Status'] == '0'
-        ]
+    except serial.SerialException as e:
+        print("❌ Serial error:", e)
+    except KeyboardInterrupt:
+        print("\n🔚 Exiting...")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
 
-    if unpaid_entries:
-        # Sort by timestamp (descending) and take the most recent
-        unpaid_entries.sort(key=lambda x: datetime.strptime(x['Timestamp'], "%Y-%m-%d %H:%M:%S"), reverse=True)
-        entry_time = datetime.strptime(unpaid_entries[0]['Timestamp'], '%Y-%m-%d %H:%M:%S')
-        return entry_time
+def process_message(message):
+    if "PLATE:" in message and "BALANCE:" in message:
+        try:
+            parts = message.split("|")
+            plate = parts[0].split("PLATE:")[1]
+            balance = int(parts[1].split("BALANCE:")[1])
+            print(f"✅ Plate: {plate} | Balance: {balance} RWF")
 
+            entry_time = lookup_entry_time(plate)
+            if entry_time:
+                compute_and_log_payment(plate, entry_time, balance)
+            else:
+                print("❌ Plate not found in log.")
+        except Exception as e:
+            print(f"⚠️ Failed to process message: {e}")
+    else:
+        print("⚠️ Unrecognized format.")
+
+def lookup_entry_time(plate):
+    if not os.path.exists(LOG_FILE):
+        return None
+
+    with open(LOG_FILE, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            if row['Plate Number'] == plate and row['Payment Status'] == '0':
+                return datetime.fromisoformat(row['Timestamp'])
     return None
 
-
-def update_payment_status(plate, amount_due):
+def update_payment_status_in_log(plate):
     rows = []
-    updated = False
-    with open(CSV_FILE, 'r') as f:
-        reader = csv.reader(f)
-        rows = list(reader)
+    with open(LOG_FILE, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            if row['Plate Number'] == plate and row['Payment Status'] == '0':
+                row['Payment Status'] = '1'
+            rows.append(row)
 
-    header = rows[0]
-    timestamp_index = header.index("Timestamp")
+    with open(LOG_FILE, "w", newline='') as csvfile:
+        fieldnames = ['Plate Number', 'Payment Status', 'Timestamp']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
-    unpaid_entries = [
-        (i, row) for i, row in enumerate(rows[1:], start=1)
-        if row[0] == plate and row[1] == '0'
-    ]
-
-    if unpaid_entries:
-        unpaid_entries.sort(key=lambda x: datetime.strptime(x[1][timestamp_index], "%Y-%m-%d %H:%M:%S"), reverse=True)
-        latest_index = unpaid_entries[0][0]
-        rows[latest_index][1] = '1'  # Mark as paid
-        rows[latest_index].append(str(amount_due))
-        updated = True
-
-    if updated:
-        with open(CSV_FILE, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerows(rows)
+    print("📝 Updated plates_log.csv with payment_status = 1")
 
 
-while True:
-    line = read_serial_line()
-    if "PLATE:" in line:
-        print(f"[RECEIVED] {line}")
-        plate, balance = parse_data(line)
-        entry_time = lookup_plate(plate)
 
-        if not entry_time:
-            print(f"[ERROR] No unpaid entry for plate {plate}")
-            continue
+def compute_and_log_payment(plate, entry_time, balance):
+    now = datetime.now()
+    duration = now - entry_time
+    duration_hours = round(duration.total_seconds() / 3600, 2)
+    amount_due = round(duration_hours * RATE_PER_HOUR)
 
-        print(f"[INFO] Card Details:")
-        print(f"Plate Number: {plate}")
-        print(f"Current Balance: {balance} RWF")
+    print(f"🕒 Duration: {duration_hours} hrs | 💸 Due: {amount_due} RWF")
 
-        duration_hours = max(1, int((datetime.now() - entry_time).total_seconds() / 3600))
-        amount_due = duration_hours * RATE_PER_HOUR
-        print(f"\n[INFO] Duration: {duration_hours} hours, Amount Due: {amount_due} RWF")
+    if balance < amount_due:
+        print("❌ Insufficient balance!")
+        return
 
-        if balance < amount_due:
-            print(f"[ERROR] Insufficient balance to make payment. Please recharge the card.")
-            ser.write(f"INSUFFICIENT\n".encode())
-            continue
+    # Send payment command to Arduino
+    command = f"PAY:{amount_due}\n"
+    print(f"➡️ Sending command to Arduino: {command.strip()}")
+    global ser  # reuse the open serial port
+    ser.write(command.encode())
 
-        # Reduce balance
-        new_balance = balance - amount_due
-        print(f"\n[INFO] Reducing balance by {amount_due} RWF. New Balance: {new_balance} RWF")
+    # Wait for 'DONE'
+    response = ser.readline().decode().strip()
+    if response == "DONE":
+        print("✅ Payment completed by Arduino.")
 
-        ser.write(f"{amount_due}\n".encode())
+        # Update plates_log.csv (mark payment_status = 1)
+        update_payment_status_in_log(plate)
 
-        response = read_serial_line()
-        if response == "DONE":
-            update_payment_status(plate, amount_due)
-            print(f"\n[SUCCESS] Payment of {amount_due} RWF processed for {plate}")
-            print(f"Updated Card Details:")
-            print(f"Plate Number: {plate}")
-            print(f"Remaining Balance: {new_balance} RWF")
-        elif response == "INSUFFICIENT":
-            print(f"[FAILED] Insufficient balance on card")
+        # Log transaction
+        os.makedirs(os.path.dirname(TX_FILE), exist_ok=True)
+        file_exists = os.path.isfile(TX_FILE)
+
+        with open(TX_FILE, "a", newline='') as csvfile:
+            fieldnames = ['plate_number', 'entry_time', 'exit_time', 'duration_hr', 'amount', 'payment_status']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow({
+                'plate_number': plate,
+                'entry_time': entry_time.isoformat(),
+                'exit_time': now.isoformat(),
+                'duration_hr': duration_hours,
+                'amount': amount_due,
+                'payment_status': 1
+            })
+    else:
+        print(f"❌ Payment failed or no DONE signal: {response}")
+
+def find_serial_port():
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        if "Arduino" in p.description or "CH340" in p.description or "ttyUSB" in p.device:
+            return p.device
+    return ports[0].device if ports else None
+
+if __name__ == "__main__":
+    port = find_serial_port()
+    if port:
+        listen_to_arduino(port)
+    else:
+        print("❌ No serial port found.")
