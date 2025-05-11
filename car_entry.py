@@ -9,7 +9,10 @@ import csv
 from collections import Counter
 
 # Load YOLOv8 model
-model = YOLO('/opt/homebrew/runs/detect/train4/weights/best.pt')
+model_path = r'C:\Users\nzabe\OneDrive\Desktop\academics\Y3\NE_STARTERS\parking-management-system\best.pt'
+
+# Load YOLOv8 model
+model = YOLO(model_path)
 
 # Plate save directory
 save_dir = 'plates'
